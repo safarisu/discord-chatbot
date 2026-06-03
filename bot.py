@@ -9,13 +9,15 @@ Setup:
 """
 
 import os
+import io
 import json
 import base64
-import asyncio
+import random
 import logging
 from datetime import datetime, timezone, timedelta
 
 import httpx
+from PIL import Image
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -120,8 +122,19 @@ async def _fetch_images(attachments: list[discord.Attachment]) -> list[dict]:
                 try:
                     resp = await client.get(att.url)
                     resp.raise_for_status()
+                    img_bytes = resp.content
+                    if config.VISION_MAX_DIMENSION > 0:
+                        img = Image.open(io.BytesIO(img_bytes))
+                        if max(img.size) > config.VISION_MAX_DIMENSION:
+                            img.thumbnail(
+                                (config.VISION_MAX_DIMENSION, config.VISION_MAX_DIMENSION),
+                                Image.LANCZOS,
+                            )
+                            buf = io.BytesIO()
+                            img.save(buf, format=img.format or "PNG")
+                            img_bytes = buf.getvalue()
                     images.append({
-                        "data": base64.b64encode(resp.content).decode(),
+                        "data": base64.b64encode(img_bytes).decode(),
                         "mime_type": mime,
                     })
                 except Exception:
@@ -228,9 +241,17 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
-    if not _should_respond(message):
-        await bot.process_commands(message)
-        return
+    triggered = _should_respond(message)
+    if not triggered:
+        spontaneous = (
+            not message.author.bot
+            and config.SPONTANEOUS_REPLY_CHANCE > 0
+            and (not config.ALLOWED_CHANNEL_IDS or message.channel.id in config.ALLOWED_CHANNEL_IDS)
+            and random.random() < config.SPONTANEOUS_REPLY_CHANCE
+        )
+        if not spontaneous:
+            await bot.process_commands(message)
+            return
 
     user_id = message.author.id
     channel_id = message.channel.id

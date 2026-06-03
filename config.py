@@ -36,7 +36,7 @@ HISTORY_MAX_AGE_MINUTES = 0
 
 # ── Rate Limiting ──────────────────────────────
 # Max bot responses per user per day (resets at UTC midnight)
-DAILY_LIMIT_PER_USER = 20
+DAILY_LIMIT_PER_USER = 50
 
 # Min seconds between responses to the same user
 COOLDOWN_PER_USER_SECONDS = 10
@@ -45,7 +45,12 @@ COOLDOWN_PER_USER_SECONDS = 10
 GLOBAL_COOLDOWN_SECONDS = 5
 
 # Max bot responses per channel per hour
-HOURLY_LIMIT_PER_CHANNEL = 20
+HOURLY_LIMIT_PER_CHANNEL = 50
+
+# ── Spontaneous Replies ────────────────────────
+# Probability (0.0–1.0) of replying to any message even without a trigger.
+# 0.0 = disabled, 0.05 = 5% chance. Channel restrictions and rate limits still apply.
+SPONTANEOUS_REPLY_CHANCE = 0.0
 
 # ── Trigger Mode ───────────────────────────────
 # "mention"  — bot replies only when @mentioned
@@ -66,6 +71,9 @@ INCLUDE_USER_ROLES = False
 # ── Vision ─────────────────────────────────────
 # Set to True if your model supports image inputs (e.g. gemma4, gpt-4o, claude-3+)
 VISION_ENABLED = True
+
+# Largest allowed side (width or height) in pixels before downscaling (0 = no limit)
+VISION_MAX_DIMENSION = 0
 
 # Include images from message history (not just the current message)
 VISION_HISTORY = False
