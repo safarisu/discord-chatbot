@@ -9,10 +9,13 @@ Setup:
 """
 
 import os
+import json
+import base64
 import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 
+import httpx
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -27,6 +30,44 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger(__name__)
+
+# ── Persona loading ────────────────────────────────────────────────────────────
+
+with open(config.PERSONAS_FILE, encoding="utf-8") as _f:
+    _personas_data: dict = json.load(_f)
+
+_meta_prompt: str = _personas_data.get("meta_prompt", "")
+_personalities: dict = _personas_data["personalities"]
+_servers: dict = _personas_data["servers"]
+_default_personality: str = _personas_data["default_personality"]
+
+# Active personality key per guild (in-memory; resets on restart)
+_guild_personalities: dict[int, str] = {}
+
+
+def _channel_context(channel) -> str:
+    if isinstance(channel, discord.DMChannel):
+        return f"You are in a direct message (DM) with {channel.recipient}."
+    if isinstance(channel, discord.Thread):
+        parent = f" in #{channel.parent.name}" if channel.parent else ""
+        return f"You are in a thread named \"{channel.name}\"{parent}."
+    if isinstance(channel, discord.TextChannel):
+        topic = f" Topic: {channel.topic}" if channel.topic else ""
+        return f"You are in #{channel.name}.{topic}"
+    return ""
+
+
+def _get_system_prompt(guild_id: int | None, personality_override: str | None = None) -> str:
+    """Build the full system prompt for a guild: personality + server context."""
+    key = personality_override or _guild_personalities.get(guild_id, _default_personality)
+    personality = _personalities.get(key) or _personalities[_default_personality]
+
+    server_key = str(guild_id) if guild_id and str(guild_id) in _servers else "default"
+    server = _servers.get(server_key) or _servers.get("default", {})
+
+    parts = [p for p in [_meta_prompt, personality["system_prompt"], server.get("context", "")] if p]
+    return "\n\n".join(parts)
+
 
 # ── Bot setup ──────────────────────────────────────────────────────────────────
 
@@ -58,6 +99,36 @@ def _should_respond(message: discord.Message) -> bool:
     return False
 
 
+def _format_author(author) -> str:
+    """Return display name with roles for guild members, plain name otherwise."""
+    if config.INCLUDE_USER_ROLES and isinstance(author, discord.Member):
+        roles = [r.name for r in author.roles if r.name != "@everyone"]
+        if roles:
+            return f"{author.display_name} [{', '.join(roles)}]"
+    return author.display_name
+
+
+async def _fetch_images(attachments: list[discord.Attachment]) -> list[dict]:
+    """Download image attachments and return as base64 dicts for the LLM."""
+    if not config.VISION_ENABLED or not attachments:
+        return []
+    images = []
+    async with httpx.AsyncClient(timeout=30) as client:
+        for att in attachments:
+            mime = (att.content_type or "").split(";")[0]
+            if mime.startswith("image/"):
+                try:
+                    resp = await client.get(att.url)
+                    resp.raise_for_status()
+                    images.append({
+                        "data": base64.b64encode(resp.content).decode(),
+                        "mime_type": mime,
+                    })
+                except Exception:
+                    pass
+    return images
+
+
 def _clean_content(message: discord.Message) -> str:
     """Strip bot mention and prefix from the message text."""
     content = message.content
@@ -68,16 +139,26 @@ def _clean_content(message: discord.Message) -> str:
     return content.strip()
 
 
-async def _build_messages(message: discord.Message) -> list[dict]:
+async def _build_messages(
+    message: discord.Message,
+    personality_override: str | None = None,
+    content_override: str | None = None,
+) -> list[dict]:
     """
     Build the message list to send to the LLM:
       [system] + [recent channel history] + [current user message]
     """
-    messages = [{"role": "system", "content": config.SYSTEM_PROMPT}]
+    guild_id = message.guild.id if message.guild else None
+    system = _get_system_prompt(guild_id, personality_override)
+    channel_note = _channel_context(message.channel)
+    if channel_note:
+        system += f"\n\n{channel_note}"
+    messages = [{"role": "system", "content": system}]
 
     # Fetch channel history
     history = []
     cutoff = None
+    vision_history_count = 0
     if config.HISTORY_MAX_AGE_MINUTES > 0:
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=config.HISTORY_MAX_AGE_MINUTES)
 
@@ -88,24 +169,33 @@ async def _build_messages(message: discord.Message) -> list[dict]:
         if cutoff and msg.created_at < cutoff:
             break
         if msg.author.bot and msg.author.id == bot.user.id:
-            role = "assistant"
+            history.append({"role": "assistant", "content": msg.content})
         else:
-            role = "user"
-            # prefix username so the model knows who said what
-            msg_content = f"[{msg.author.display_name}]: {msg.content}"
-            history.append({"role": role, "content": msg_content})
-            continue
-        history.append({"role": role, "content": msg.content})
+            entry: dict = {
+                "role": "user",
+                "content": f"[{_format_author(msg.author)}]: {msg.content}",
+            }
+            under_limit = config.VISION_HISTORY_LIMIT == 0 or vision_history_count < config.VISION_HISTORY_LIMIT
+            if config.VISION_HISTORY and under_limit:
+                imgs = await _fetch_images(msg.attachments)
+                if imgs:
+                    entry["images"] = imgs
+                    vision_history_count += 1
+            history.append(entry)
 
     # History is newest-first; reverse for chronological order
     messages.extend(reversed(history))
 
     # Add current message
-    user_text = _clean_content(message)
-    messages.append({
+    user_text = content_override if content_override is not None else _clean_content(message)
+    current: dict = {
         "role": "user",
-        "content": f"[{message.author.display_name}]: {user_text}",
-    })
+        "content": f"[{_format_author(message.author)}]: {user_text}",
+    }
+    imgs = await _fetch_images(message.attachments)
+    if imgs:
+        current["images"] = imgs
+    messages.append(current)
 
     return messages
 
@@ -160,6 +250,10 @@ async def on_message(message: discord.Message):
             await message.reply(f"⚠️ Sorry, something went wrong: `{e}`", mention_author=False)
             return
 
+    if not reply_text:
+        log.warning("LLM returned empty response, skipping send")
+        return
+
     # Record usage AFTER a successful response
     limiter.record(user_id, channel_id)
 
@@ -199,6 +293,82 @@ async def botinfo(ctx: commands.Context):
         f"Cooldown: `{config.COOLDOWN_PER_USER_SECONDS}s`",
         mention_author=False,
     )
+
+
+@bot.command(name="personas")
+async def list_personas(ctx: commands.Context):
+    """List all available personalities."""
+    lines = []
+    active_key = _guild_personalities.get(ctx.guild.id if ctx.guild else None, _default_personality)
+    for key, p in _personalities.items():
+        marker = " ◀ active" if key == active_key else ""
+        lines.append(f"`{key}` — **{p['name']}**: {p['description']}{marker}")
+    await ctx.reply("🎭 **Available personalities**\n" + "\n".join(lines), mention_author=False)
+
+
+@bot.command(name="ask")
+async def ask_as(ctx: commands.Context, persona: str, *, message: str):
+    """Send a one-shot message using any personality without changing the server default."""
+    if persona not in _personalities:
+        # available = ", ".join(f"`{k}`" for k in _personalities)
+        # await ctx.reply(f"❌ Unknown personality `{persona}`. Available: {available}", mention_author=False)
+        # return
+        persona = _default_personality
+
+    allowed, reason = limiter.check(ctx.author.id, ctx.channel.id)
+    if not allowed:
+        await ctx.reply(reason, mention_author=False)
+        return
+
+    async with ctx.typing():
+        try:
+            msg_list = await _build_messages(ctx.message, personality_override=persona, content_override=message)
+            reply_text = await llm.chat(msg_list)
+        except Exception as e:
+            log.exception("LLM error")
+            await ctx.reply(f"⚠️ Sorry, something went wrong: `{e}`", mention_author=False)
+            return
+
+    if not reply_text:
+        log.warning("LLM returned empty response, skipping send")
+        return
+
+    limiter.record(ctx.author.id, ctx.channel.id)
+    for chunk in _split_message(reply_text):
+        await ctx.reply(chunk, mention_author=False)
+
+
+@ask_as.error
+async def ask_as_error(ctx: commands.Context, error: commands.CommandError):
+    if isinstance(error, commands.MissingRequiredArgument):
+        available = ", ".join(f"`{k}`" for k in _personalities)
+        await ctx.reply(
+            f"Usage: `{config.BOT_PREFIX}askas <persona> <message>` — available: {available}",
+            mention_author=False,
+        )
+
+
+@bot.command(name="persona")
+@commands.has_permissions(manage_guild=True)
+async def set_persona(ctx: commands.Context, name: str):
+    """Switch the active personality for this server (requires Manage Server)."""
+    if name not in _personalities:
+        available = ", ".join(f"`{k}`" for k in _personalities)
+        await ctx.reply(f"❌ Unknown personality `{name}`. Available: {available}", mention_author=False)
+        return
+    guild_id = ctx.guild.id if ctx.guild else None
+    _guild_personalities[guild_id] = name
+    p = _personalities[name]
+    await ctx.reply(f"✅ Switched to **{p['name']}** — {p['description']}", mention_author=False)
+
+
+@set_persona.error
+async def set_persona_error(ctx: commands.Context, error: commands.CommandError):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.reply("❌ You need **Manage Server** permission to change the personality.", mention_author=False)
+    elif isinstance(error, commands.MissingRequiredArgument):
+        available = ", ".join(f"`{k}`" for k in _personalities)
+        await ctx.reply(f"Usage: `{config.BOT_PREFIX}persona <name>` — available: {available}", mention_author=False)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────

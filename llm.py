@@ -3,7 +3,6 @@ llm.py — Unified LLM interface supporting OpenAI, Anthropic, Ollama, OpenRoute
 """
 
 import httpx
-import json
 import config
 
 
@@ -13,14 +12,48 @@ async def chat(messages: list[dict]) -> str:
 
     if provider == "openai":
         return await _openai(messages)
-    elif provider == "anthropic":
+    if provider == "anthropic":
         return await _anthropic(messages)
-    elif provider == "ollama":
+    if provider == "ollama":
         return await _ollama(messages)
-    elif provider == "openrouter":
+    if provider == "openrouter":
         return await _openrouter(messages)
-    else:
-        raise ValueError(f"Unknown LLM_PROVIDER: {provider!r}")
+    raise ValueError(f"Unknown LLM_PROVIDER: {provider!r}")
+
+
+# ── Per-provider message serialisers ───────────────────────────────────────────
+# Internal format: {"role": str, "content": str, "images"?: [{"data": b64, "mime_type": str}]}
+
+def _openai_msg(m: dict) -> dict:
+    if not m.get("images"):
+        return {"role": m["role"], "content": m["content"]}
+    content = [{"type": "text", "text": m["content"]}]
+    for img in m["images"]:
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{img['mime_type']};base64,{img['data']}"},
+        })
+    return {"role": m["role"], "content": content}
+
+
+def _anthropic_msg(m: dict) -> dict:
+    if not m.get("images"):
+        return {"role": m["role"], "content": m["content"]}
+    content = []
+    for img in m["images"]:
+        content.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": img["mime_type"], "data": img["data"]},
+        })
+    content.append({"type": "text", "text": m["content"]})
+    return {"role": m["role"], "content": content}
+
+
+def _ollama_msg(m: dict) -> dict:
+    msg = {"role": m["role"], "content": m["content"]}
+    if m.get("images"):
+        msg["images"] = [img["data"] for img in m["images"]]
+    return msg
 
 
 # ── OpenAI ─────────────────────────────────────────────────────────────────────
@@ -32,7 +65,7 @@ async def _openai(messages: list[dict]) -> str:
             headers={"Authorization": f"Bearer {config.OPENAI_API_KEY}"},
             json={
                 "model": config.LLM_MODEL,
-                "messages": messages,
+                "messages": [_openai_msg(m) for m in messages],
                 "max_tokens": config.MAX_RESPONSE_TOKENS,
             },
         )
@@ -43,9 +76,9 @@ async def _openai(messages: list[dict]) -> str:
 # ── Anthropic ──────────────────────────────────────────────────────────────────
 
 async def _anthropic(messages: list[dict]) -> str:
-    # Anthropic requires system prompt as a separate field
-    system = config.SYSTEM_PROMPT
-    non_system = [m for m in messages if m["role"] != "system"]
+    # Anthropic requires system prompt as a separate top-level field
+    system = next((m["content"] for m in messages if m["role"] == "system"), "")
+    non_system = [_anthropic_msg(m) for m in messages if m["role"] != "system"]
 
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(
@@ -74,7 +107,7 @@ async def _ollama(messages: list[dict]) -> str:
             f"{config.OLLAMA_BASE_URL}/api/chat",
             json={
                 "model": config.LLM_MODEL,
-                "messages": messages,
+                "messages": [_ollama_msg(m) for m in messages],
                 "stream": False,
                 "options": {"num_predict": config.MAX_RESPONSE_TOKENS},
             },
@@ -95,7 +128,7 @@ async def _openrouter(messages: list[dict]) -> str:
             },
             json={
                 "model": config.LLM_MODEL,
-                "messages": messages,
+                "messages": [_openai_msg(m) for m in messages],
                 "max_tokens": config.MAX_RESPONSE_TOKENS,
             },
         )
