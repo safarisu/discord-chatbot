@@ -102,15 +102,19 @@ async def _anthropic(messages: list[dict]) -> str:
 # ── Ollama (local) ─────────────────────────────────────────────────────────────
 
 async def _ollama(messages: list[dict]) -> str:
+    body: dict = {
+        "model": config.LLM_MODEL,
+        "messages": [_ollama_msg(m) for m in messages],
+        "stream": False,
+        "options": {"num_predict": config.MAX_RESPONSE_TOKENS},
+    }
+    if config.OLLAMA_DISABLE_THINKING:
+        body["think"] = False
+
     async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(
             f"{config.OLLAMA_BASE_URL}/api/chat",
-            json={
-                "model": config.LLM_MODEL,
-                "messages": [_ollama_msg(m) for m in messages],
-                "stream": False,
-                "options": {"num_predict": config.MAX_RESPONSE_TOKENS},
-            },
+            json=body,
         )
         resp.raise_for_status()
         return resp.json()["message"]["content"].strip()

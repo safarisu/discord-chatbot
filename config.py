@@ -11,7 +11,7 @@ LLM_PROVIDER = "ollama"
 #   anthropic:   "claude-haiku-4-5-20251001"
 #   ollama:      "llama3.2", "mistral", "phi3"
 #   openrouter:  "meta-llama/llama-3.1-8b-instruct:free"
-LLM_MODEL = "gemma4:e2b"
+LLM_MODEL = "qwen3.5:0.8b"
 
 # API keys (leave empty "" if not used)
 OPENAI_API_KEY = ""
@@ -20,6 +20,10 @@ OPENROUTER_API_KEY = ""   # get free key at openrouter.ai
 
 # Ollama base URL (local or remote)
 OLLAMA_BASE_URL = "http://localhost:11434"
+
+# Disable chain-of-thought thinking tokens for models that support it (e.g. Qwen3).
+# Prevents the model spending its entire token budget on reasoning with nothing left to say.
+OLLAMA_DISABLE_THINKING = True
 
 # ── Personas ───────────────────────────────────
 # Personalities and server contexts live in personas.json.
@@ -50,7 +54,7 @@ HOURLY_LIMIT_PER_CHANNEL = 50
 # ── Spontaneous Replies ────────────────────────
 # Probability (0.0–1.0) of replying to any message even without a trigger.
 # 0.0 = disabled, 0.05 = 5% chance. Channel restrictions and rate limits still apply.
-SPONTANEOUS_REPLY_CHANCE = 0.0
+SPONTANEOUS_REPLY_CHANCE = 0.02
 
 # ── Trigger Mode ───────────────────────────────
 # "mention"  — bot replies only when @mentioned
